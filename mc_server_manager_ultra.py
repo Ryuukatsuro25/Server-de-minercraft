@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Minecraft Server Manager ULTRA
 --------------------------------
@@ -38,6 +37,7 @@ import socket
 import struct
 import threading
 import subprocess
+import signal
 import webbrowser
 import traceback
 from pathlib import Path
@@ -385,7 +385,9 @@ def download_with_progress(session: requests.Session, url: str, dest_path: str, 
 def download_forge_installer(mc_version: str, forge_version: str, dest_dir: str, progress_cb=None):
     if not forge_version:
         raise RuntimeError("Versión de Forge vacía.")
-    full = forge_version if forge_version.startswith(f"{mc_version}-") else f"{mc_version}-{forge_version}"
+    # Strip (recommended) or (latest) if present
+    forge_num = forge_version.split(' (')[0]
+    full = f"{mc_version}-{forge_num}" if not forge_num.startswith(f"{mc_version}-") else forge_num
     dest_path = os.path.join(dest_dir, f"forge-{full}-installer.jar")
     urls = [
         f"https://maven.minecraftforge.net/net/minecraftforge/forge/{full}/forge-{full}-installer.jar",
@@ -447,7 +449,7 @@ class ProcessReader(threading.Thread):
 
     def run(self):
         try:
-            for line in self.stream:
+            for line in iter(self.stream.readline, ''):
                 if not line:
                     break
                 self.q.put((self.tag, line.rstrip("\r\n"), self.color_hint))
@@ -470,6 +472,7 @@ class ManagedProcess:
         self.stdout_reader = None
         self.stderr_reader = None
         self._pty_master = None  # solo Unix
+        self._pty_reader_file = None
 
     def is_running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -486,7 +489,7 @@ class ManagedProcess:
         if is_windows():
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
-            start_new_session = True  # Python 3.8+
+            start_new_session = True  # nueva sesión -> podremos killpg
 
         try:
             if use_pty and not is_windows():
@@ -508,8 +511,8 @@ class ManagedProcess:
                 )
                 # Cerramos el slave en el padre; leemos el master como archivo de texto
                 _os.close(s)
-                self.stdout_reader = ProcessReader(io.open(m, mode="r", buffering=1, encoding="utf-8", errors="replace"),
-                                                   self.q, self.name, None)
+                self._pty_reader_file = io.open(m, mode="r", buffering=1, encoding="utf-8", errors="replace")
+                self.stdout_reader = ProcessReader(self._pty_reader_file, self.q, self.name, None)
                 self.stdout_reader.start()
                 self.stderr_reader = None
             else:
@@ -556,9 +559,14 @@ class ManagedProcess:
         if not self.is_running():
             return
         try:
-            if gently and gentle_cmd:
-                self.q.put(("sys", f"[{self.name}] Deteniendo con '{gentle_cmd}'...", None))
-                self.sendline(gentle_cmd)
+            if gently:
+                # Guardado explícito antes de parar
+                self.q.put(("sys", f"[{self.name}] Guardando mundo...", None))
+                self.sendline("save-all flush")
+                time.sleep(0.6)
+                if gentle_cmd:
+                    self.q.put(("sys", f"[{self.name}] Deteniendo con '{gentle_cmd}'...", None))
+                    self.sendline(gentle_cmd)
                 deadline = time.time() + wait_sec
                 while self.is_running() and time.time() < deadline:
                     time.sleep(0.2)
@@ -566,13 +574,19 @@ class ManagedProcess:
             if self.is_running():
                 self.q.put(("sys", f"[{self.name}] Terminando proceso...", None))
                 if is_windows():
+                    # Mata el árbol de procesos
                     try:
                         subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
                                        capture_output=True, text=True, timeout=5)
                     except Exception:
                         self.proc.terminate()
                 else:
-                    self.proc.terminate()
+                    import os as _os
+                    try:
+                        pgid = _os.getpgid(self.proc.pid)
+                        _os.killpg(pgid, signal.SIGTERM)
+                    except Exception:
+                        self.proc.terminate()
 
             deadline = time.time() + 5
             while self.is_running() and time.time() < deadline:
@@ -580,12 +594,32 @@ class ManagedProcess:
 
             if self.is_running():
                 self.q.put(("sys", f"[{self.name}] Forzando cierre...", None))
-                self.proc.kill()
+                if is_windows():
+                    self.proc.kill()
+                else:
+                    import os as _os
+                    try:
+                        pgid = _os.getpgid(self.proc.pid)
+                        _os.killpg(pgid, signal.SIGKILL)
+                    except Exception:
+                        self.proc.kill()
         except Exception as e:
             self.q.put(("sys", f"[{self.name}] Error al terminar: {e}", None))
         finally:
+            # Cierra PTY y lectores
+            try:
+                if self.stdout_reader and self.stdout_reader.is_alive():
+                    # no hay join duro; dejamos que cierre solo
+                    pass
+                if self.stderr_reader and self.stderr_reader.is_alive():
+                    pass
+                if self._pty_reader_file:
+                    self._pty_reader_file.close()
+            except Exception:
+                pass
             self.proc = None
             self._pty_master = None
+            self._pty_reader_file = None
 
 
 # ------------------------------------------------------------------------------
@@ -619,14 +653,17 @@ class ScrollableFrame(ttk.Frame):
         self.canvas.bind_all("<Button-5>", self._on_mousewheel_linux)  # Linux down
 
     def _on_mousewheel(self, event):
-        # Windows/macOS
-        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        # Verifica que el Canvas aún exista antes de intentar desplazarlo
+        if self.canvas.winfo_exists():
+            # Windows/macOS
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
 
     def _on_mousewheel_linux(self, event):
-        if event.num == 4:
-            self.canvas.yview_scroll(-3, "units")
-        elif event.num == 5:
-            self.canvas.yview_scroll(3, "units")
+        if self.canvas.winfo_exists():
+            if event.num == 4:
+                self.canvas.yview_scroll(-3, "units")
+            elif event.num == 5:
+                self.canvas.yview_scroll(3, "units")
 
 
 class MinecraftGUI(tk.Tk):
@@ -861,8 +898,8 @@ class MinecraftGUI(tk.Tk):
                 self.server_properties.setdefault("network-compression-threshold", "512")
                 self.server_properties.setdefault("max-tick-time", "60000")
 
-            txt = render_properties(self.server_properties)
-            write_text_file(self._server_properties_path(), txt)
+            # Escritura en latin-1 (seguro para MOTD y compañía)
+            write_properties_file(self._server_properties_path(), self.server_properties)
         except Exception as e:
             self._log_sys(f"Error guardando server.properties: {e}")
 
@@ -1086,6 +1123,7 @@ class MinecraftGUI(tk.Tk):
             "-Dterminal.jline=false",
             "-Dterminal.ansi=true",
             "-Djline.terminal=jline.UnsupportedTerminal",
+            "-Dfile.encoding=UTF-8",
         ]
         if self.app_config.get("enable_jvm_optim", True):
             flags += [
@@ -1183,8 +1221,9 @@ class MinecraftGUI(tk.Tk):
             self._stop_autosave_thread()
             # Puerto ocupado?
             port = int(self.app_config.get("server_port", 25565))
-            if not is_port_free(port):
-                self._log_sys(f"Advertencia: el puerto {port} sigue ocupado. Espera unos segundos o cambia el puerto en Configurar.")
+            if not wait_port_release(port, timeout=12):
+                self._log_sys(f"Advertencia: el puerto {port} sigue ocupado. Puede quedar en TIME_WAIT unos segundos o "
+                              f"persistir si hay un proceso huérfano. Si continúa, reinicia Java o cambia el puerto en Configurar.")
             self._refresh_status_labels()
         except Exception as e:
             self._log_sys(f"Error al detener: {e}")
@@ -1379,6 +1418,11 @@ class MinecraftGUI(tk.Tk):
         except Exception:
             pass
         self._stop_autosave_thread()
+        # pequeña espera opcional para liberar puerto
+        try:
+            wait_port_release(int(self.app_config.get("server_port", 25565)), timeout=5)
+        except Exception:
+            pass
         self.destroy()
 
     # ---------- Configuración (diálogo con SCROLL) ----------
@@ -1412,7 +1456,7 @@ class MinecraftGUI(tk.Tk):
         # Java
         ttk.Label(lf_paths, text="Ruta de Java:").grid(row=row, column=0, sticky="w")
         var_java = tk.StringVar(value=self.app_config.get("java_path", "java"))
-        e_java = ttk.Entry(lf_paths, textvariable=var_java)
+        e_java = ttk.Entry(lf_paths, textvariable=var_java, width=48)
         e_java.grid(row=row, column=1, sticky="ew", padx=6)
         ttk.Button(lf_paths, text="Buscar...", command=lambda: self._pick_file(var_java)).grid(row=row, column=2, padx=4)
         row += 1
