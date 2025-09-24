@@ -7,20 +7,21 @@ App GUI (Tkinter) para crear, iniciar y administrar servidores locales de Minecr
 consola en tiempo real, envío de comandos robusto (STDIN + RCON), diálogo de
 configuración con **scroll**, estilos modernos y UX clara.
 
-Objetivos de esta versión:
-- Arreglar: no aparecen mensajes del chat / consola -> lector robusto (STDOUT+STDERR),
-  soporte PTY en Linux/macOS para que JLine no moleste y **flags anti-JLine**
-  en todas las plataformas.
-- Arreglar: "comandos no sirven" -> envío vía STDIN cuando el server lo lleva la app
-  + plan B por **RCON** cuando el server fue iniciado afuera.
-- Arreglar: diálogo de configuración muy grande -> **frame desplazable** con Canvas+Scrollbar.
-- Visual: estilos ttk, etiquetas de estado, colores de log (INFO/WARN/ERROR/CHAT), y layout ordenado.
-- Túneles: prioriza *.joinmc.link, oculta logs del agente, guarda UN enlace por servidor.
-- Fácil de entender: textos claros, ayuda rápida, botones obvios.
+Mejoras integradas:
+- Barra de progreso para descargas
+- Detección de proceso que ocupa puertos
+- Validaciones antes de iniciar servidor
+- Sistema de backups del mundo
+- Logs persistentes con rotación
+- Mejoras en la UI de dirección pública
+- Menú contextual en consola
+- Seguridad RCON mejorada
+- Persistencia de tamaño/posición de ventana
+- Y muchas mejoras más...
 
 Requisitos:
 - Python 3.8+
-- pip install requests
+- pip install requests psutil
 - Java instalado (o configura la ruta en "Configurar")
 - (Opcional) agente playit.gg descargado
 
@@ -40,8 +41,13 @@ import subprocess
 import signal
 import webbrowser
 import traceback
+import logging
+import zipfile
+import secrets
+import string
 from pathlib import Path
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 import re
 import xml.etree.ElementTree as ET
 
@@ -57,6 +63,12 @@ try:
 except ImportError:
     print("Falta el paquete 'requests'. Instálalo con: pip install requests")
     sys.exit(1)
+
+try:
+    import psutil
+except ImportError:
+    print("Falta el paquete 'psutil'. Instálalo con: pip install psutil")
+    psutil = None
 
 # ------------------------------------------------------------------------------
 # Constantes y utilidades
@@ -103,7 +115,11 @@ DEFAULT_APP_CONFIG = {
     # Consola
     "hide_playit_logs": True,
     # Linux/macOS: usar PTY para evitar problemas de JLine (recomendado)
-    "use_pty_on_unix": True
+    "use_pty_on_unix": True,
+    # Ventana
+    "window_geometry": "",
+    # Filtros consola
+    "hide_info_logs": False,
 }
 
 DEFAULT_SERVER_PROPERTIES = {
@@ -250,6 +266,130 @@ def is_port_free(port: int, host: str = "0.0.0.0") -> bool:
             return True
         except OSError:
             return False
+
+
+def who_uses_port(port: int) -> str:
+    """Detecta qué proceso está usando un puerto."""
+    try:
+        if psutil:
+            for conn in psutil.net_connections():
+                if conn.laddr and conn.laddr.port == port:
+                    try:
+                        proc = psutil.Process(conn.pid)
+                        return f"PID {conn.pid} ({proc.name()})"
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        return f"PID {conn.pid} (proceso no accesible)"
+    except Exception:
+        pass
+    
+    # Fallback sin psutil
+    try:
+        if is_windows():
+            cmd = ["netstat", "-ano", "-p", "tcp"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            for line in result.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        return f"PID {parts[-1]} (netstat)"
+        else:
+            cmd = ["lsof", "-i", f":{port}"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.stdout:
+                lines = result.stdout.strip().split('\n')
+                if len(lines) > 1:
+                    return lines[1][:100]
+    except Exception:
+        pass
+    
+    return "No se pudo determinar"
+
+
+def wait_port_release(port: int, host: str = "0.0.0.0", timeout: float = 12.0, poll: float = 0.25) -> bool:
+    """
+    Espera hasta que el puerto quede libre (se pueda bindear) o expire el timeout.
+    Devuelve True si quedó libre, False si siguió ocupado.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        free_any = is_port_free(port, host=host) or is_port_free(port, host="127.0.0.1")
+        if free_any:
+            return True
+        time.sleep(poll)
+    
+    # último intento
+    free_now = is_port_free(port, host=host) or is_port_free(port, host="127.0.0.1")
+    if not free_now:
+        owner = who_uses_port(port)
+        print(f"El puerto {port} parece estar ocupado por: {owner}")
+    return free_now
+
+
+def write_properties_file(path: str, props: dict):
+    """
+    Escribe server.properties en latin-1 (con reemplazo) para evitar problemas con MOTD y acentos.
+    """
+    ensure_dir(str(Path(path).parent))
+    text = render_properties(props)
+    with open(path, "w", encoding="latin-1", errors="replace") as f:
+        f.write(text)
+
+
+def generate_random_password(length=20):
+    """Genera una contraseña aleatoria segura."""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+# ------------------------------------------------------------------------------
+# Diálogo de progreso para descargas
+# ------------------------------------------------------------------------------
+
+class ProgressDialog(tk.Toplevel):
+    def __init__(self, parent, title="Descargando", max_value=100):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("400x120")
+        self.transient(parent)
+        self.grab_set()
+        self.max_value = max_value
+        self.var = tk.DoubleVar()
+        self.var.set(0)
+        
+        self.label = ttk.Label(self, text="Preparando...")
+        self.label.pack(pady=10)
+        
+        self.progress = ttk.Progressbar(self, variable=self.var, maximum=max_value, length=350)
+        self.progress.pack(pady=5)
+        
+        self.status_label = ttk.Label(self, text="")
+        self.status_label.pack(pady=5)
+        
+        self.cancelled = False
+        self.button = ttk.Button(self, text="Cancelar", command=self.cancel)
+        self.button.pack(pady=5)
+        
+        self.center()
+
+    def center(self):
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - (self.winfo_width() // 2)
+        y = (self.winfo_screenheight() // 2) - (self.winfo_height() // 2)
+        self.geometry(f"+{x}+{y}")
+
+    def cancel(self):
+        self.cancelled = True
+        self.destroy()
+
+    def update_progress(self, value, text=None, status=None):
+        if self.cancelled:
+            return
+        self.var.set(min(value, self.max_value))
+        if text:
+            self.label.config(text=text)
+        if status:
+            self.status_label.config(text=status)
+        self.update_idletasks()
 
 
 # ------------------------------------------------------------------------------
@@ -670,14 +810,22 @@ class MinecraftGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1120x760")
+        
+        # Cargar configuración antes de establecer geometría
+        self._load_app_config()
+        
+        # Establecer geometría guardada o por defecto
+        geometry = self.app_config.get("window_geometry", "1120x760")
+        self.geometry(geometry)
         self.minsize(980, 640)
+
+        # Configurar logging
+        self._setup_logging()
 
         # Estilo
         self._init_style()
 
         # Estado
-        self.app_config = DEFAULT_APP_CONFIG.copy()
         self.server_properties = DEFAULT_SERVER_PROPERTIES.copy()
         self.players_online = set()
         self.public_address = ""
@@ -694,12 +842,37 @@ class MinecraftGUI(tk.Tk):
 
         # UI
         self._build_ui()
-        self._load_app_config()
         self._load_server_properties()
         self._refresh_status_labels()
 
         self.protocol("WM_DELETE_WINDOW", self._on_exit)
         self.after(80, self._drain_console_queue)
+
+    # ---------- Logging ----------
+
+    def _setup_logging(self):
+        """Configura el sistema de logging con rotación de archivos."""
+        log_dir = APP_STATE_DIR / "logs"
+        ensure_dir(str(log_dir))
+        log_file = log_dir / "app.log"
+        
+        self.logger = logging.getLogger(APP_NAME)
+        self.logger.setLevel(logging.INFO)
+        
+        # Evitar múltiples handlers si se reinicia la app
+        if not self.logger.handlers:
+            handler = RotatingFileHandler(
+                log_file, 
+                maxBytes=2*1024*1024,  # 2 MB
+                backupCount=3,
+                encoding='utf-8'
+            )
+            formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
 
     # ---------- Estilo ----------
 
@@ -722,19 +895,28 @@ class MinecraftGUI(tk.Tk):
     def _build_ui(self):
         # Menú
         menubar = tk.Menu(self)
+        
+        # Menú Archivo
         filemenu = tk.Menu(menubar, tearoff=False)
         filemenu.add_command(label="Abrir carpeta del servidor", command=self._open_server_dir)
         filemenu.add_command(label="Abrir carpeta de mods", command=self._open_mods_dir)
+        filemenu.add_separator()
+        filemenu.add_command(label="Crear backup del mundo", command=self._create_backup)
+        filemenu.add_command(label="Restaurar backup", command=self._restore_backup)
+        filemenu.add_separator()
         filemenu.add_command(label="Importar jar de Forge", command=self._import_forge_jar)
         filemenu.add_separator()
         filemenu.add_command(label="Salir", command=self._on_exit)
         menubar.add_cascade(label="Archivo", menu=filemenu)
 
+        # Menú Ver
         viewmenu = tk.Menu(menubar, tearoff=False)
         viewmenu.add_command(label="Limpiar consola", command=lambda: self.console.delete("1.0", tk.END))
-        viewmenu.add_checkbutton(label="Autoscroll", command=self._toggle_autoscroll)
+        viewmenu.add_checkbutton(label="Autoscroll", variable=tk.BooleanVar(value=self.app_config.get("console_autoscroll", True)), command=self._toggle_autoscroll)
+        viewmenu.add_checkbutton(label="Ocultar logs INFO", variable=tk.BooleanVar(value=self.app_config.get("hide_info_logs", False)), command=self._toggle_hide_info)
         menubar.add_cascade(label="Ver", menu=viewmenu)
 
+        # Menú Ayuda
         helpmenu = tk.Menu(menubar, tearoff=False)
         helpmenu.add_command(label="Ayuda rápida", command=self._show_help)
         helpmenu.add_command(label="Acerca de", command=self._show_about)
@@ -766,6 +948,16 @@ class MinecraftGUI(tk.Tk):
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.console = tk.Text(left, wrap="none", height=24, font=("Consolas", 10))
+        
+        # Menú contextual para la consola
+        self.console_menu = tk.Menu(self.console, tearoff=0)
+        self.console_menu.add_command(label="Copiar", command=self._copy_console_selection)
+        self.console_menu.add_command(label="Seleccionar todo", command=self._select_all_console)
+        self.console_menu.add_separator()
+        self.console_menu.add_command(label="Limpiar", command=lambda: self.console.delete("1.0", tk.END))
+        
+        self.console.bind("<Button-3>", self._show_console_menu)  # Click derecho
+
         ysb = ttk.Scrollbar(left, orient="vertical", command=self.console.yview)
         xsb = ttk.Scrollbar(left, orient="horizontal", command=self.console.xview)
         self.console.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
@@ -802,7 +994,11 @@ class MinecraftGUI(tk.Tk):
         self.var_public = tk.StringVar(value="(sin detectar)")
         self.cb_public = ttk.Combobox(right, textvariable=self.var_public, state="readonly", width=34)
         self.cb_public.pack(anchor="w", pady=2)
-        ttk.Button(right, text="Copiar", command=self._copy_public).pack(anchor="w", pady=2)
+        
+        public_buttons = ttk.Frame(right)
+        public_buttons.pack(anchor="w", pady=2)
+        ttk.Button(public_buttons, text="Copiar", command=self._copy_public).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(public_buttons, text="Abrir", command=self._open_public).pack(side=tk.LEFT)
 
         ttk.Separator(right, orient="horizontal").pack(fill=tk.X, pady=8)
         ttk.Label(right, text="RCON", style="Header.TLabel").pack(anchor="w", pady=(0,6))
@@ -822,10 +1018,41 @@ class MinecraftGUI(tk.Tk):
         # Barra inferior
         bottom = ttk.Frame(self, padding=(10, 6))
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
-        self.var_autoscroll = tk.BooleanVar(value=True)
+        
+        self.var_autoscroll = tk.BooleanVar(value=self.app_config.get("console_autoscroll", True))
         ttk.Checkbutton(bottom, text="Autoscroll", variable=self.var_autoscroll,
                         command=self._toggle_autoscroll).pack(side=tk.RIGHT)
+        
+        self.var_hide_info = tk.BooleanVar(value=self.app_config.get("hide_info_logs", False))
+        ttk.Checkbutton(bottom, text="Ocultar INFO", variable=self.var_hide_info,
+                        command=self._toggle_hide_info).pack(side=tk.RIGHT, padx=(0, 10))
+        
         ttk.Button(bottom, text="Salir", command=self._on_exit).pack(side=tk.RIGHT, padx=6)
+
+    # ---------- Menú contextual consola ----------
+
+    def _show_console_menu(self, event):
+        """Muestra el menú contextual en la consola."""
+        try:
+            self.console_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.console_menu.grab_release()
+
+    def _copy_console_selection(self):
+        """Copia la selección actual de la consola al portapapeles."""
+        try:
+            selected = self.console.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.clipboard_clear()
+            self.clipboard_append(selected)
+        except tk.TclError:
+            # No hay selección
+            pass
+
+    def _select_all_console(self):
+        """Selecciona todo el texto de la consola."""
+        self.console.tag_add(tk.SEL, "1.0", tk.END)
+        self.console.mark_set(tk.INSERT, "1.0")
+        self.console.see(tk.INSERT)
 
     # ---------- Cargar/Guardar ----------
 
@@ -854,6 +1081,9 @@ class MinecraftGUI(tk.Tk):
         return Path(self.server_jar_alias_path).exists() and Path(self._eula_path()).exists()
 
     def _load_app_config(self):
+        # Inicializar con valores por defecto
+        self.app_config = DEFAULT_APP_CONFIG.copy()
+        
         try:
             ensure_dir(str(APP_STATE_DIR))
             p = Path(self._app_config_path())
@@ -862,9 +1092,8 @@ class MinecraftGUI(tk.Tk):
                     data = json.load(f)
                     self.app_config.update(data or {})
         except Exception as e:
-            self._log_sys(f"Error cargando app_config: {e}")
+            print(f"Error cargando app_config: {e}")
         ensure_dir(self.server_dir)
-        self.var_autoscroll.set(bool(self.app_config.get("console_autoscroll", True)))
 
     def _save_app_config(self):
         try:
@@ -909,16 +1138,25 @@ class MinecraftGUI(tk.Tk):
         self.app_config["console_autoscroll"] = bool(self.var_autoscroll.get())
         self._save_app_config()
 
+    def _toggle_hide_info(self):
+        self.app_config["hide_info_logs"] = bool(self.var_hide_info.get())
+        self._save_app_config()
+
     def _console_insert(self, tag: str, text: str):
+        # Si está activado ocultar INFO y es un log INFO, no mostrar
+        if (self.var_hide_info.get() and tag == "MC" and 
+            "INFO" in text and not any(x in text for x in ["CHAT", "WARN", "ERROR"])):
+            return
+            
         # Detectar nivel/CHAT y aplicar tag
         tag_use = None
         if tag == "sys":
             tag_use = "SYS"
         else:
             msg = text
-            if "ERROR" in msg:
+            if "ERROR" in msg or "[ERROR]" in msg:
                 tag_use = "ERROR"
-            elif "WARN" in msg:
+            elif "WARN" in msg or "[WARN]" in msg or "[Warning]" in msg:
                 tag_use = "WARN"
             else:
                 # Chat ej: [Server thread/INFO]: <User> hola
@@ -927,6 +1165,10 @@ class MinecraftGUI(tk.Tk):
                 else:
                     tag_use = "INFO"
 
+        # Escribir en el logger
+        self.logger.info(f"[{tag}] {text}")
+        
+        # Insertar en la consola gráfica
         self.console.insert(tk.END, f"[{timestamp()}] {text}\n", tag_use)
         if self.var_autoscroll.get():
             self.console.see(tk.END)
@@ -981,7 +1223,7 @@ class MinecraftGUI(tk.Tk):
             self._public_candidates.sort(key=lambda hp: (".joinmc.link" not in hp, ".playit.gg" not in hp, hp))
             self.cb_public["values"] = self._public_candidates
             saved = self.app_config.get("tunnels_per_dir", {}).get(self.server_dir, "")
-            choice = saved if saved in self._public_candidates else self._public_candidates[0]
+            choice = saved if saved in self._public_candidates else (self._public_candidates[0] if self._public_candidates else "")
             self.var_public.set(choice)
             self.public_address = choice
             tunnels = self.app_config.get("tunnels_per_dir", {})
@@ -1018,6 +1260,14 @@ class MinecraftGUI(tk.Tk):
         try:
             ensure_dir(self.server_dir)
             self._log_sys(f"Carpeta del servidor: {self.server_dir}")
+            
+            # Generar contraseña RCON aleatoria si es la default
+            if self.app_config.get("rcon_password", "minecraft") == "minecraft":
+                new_pass = generate_random_password()
+                self.app_config["rcon_password"] = new_pass
+                self._save_app_config()
+                self._log_sys(f"Contraseña RCON generada automáticamente: {new_pass}")
+            
             if self.app_config.get("server_type", "vanilla") == "vanilla":
                 self._create_vanilla_server()
             else:
@@ -1045,14 +1295,39 @@ class MinecraftGUI(tk.Tk):
 
         if not Path(jar_path).exists():
             self._log_sys(f"Descargando server.jar ({ver_id})...")
-            sess = requests.Session()
-            def cb(done, total):
-                if total > 0:
-                    self._log_sys(f"Descarga: {100.0*done/total:.1f}% ({human_size(done)}/{human_size(total)})")
-                else:
-                    self._log_sys(f"Descarga: {human_size(done)}")
-            download_with_progress(sess, jar_url, jar_path, progress_cb=cb)
-            self._log_sys("Descarga completa.")
+            
+            # Diálogo de progreso
+            progress_dialog = ProgressDialog(self, title="Descargando server.jar", max_value=100)
+            
+            def download_thread():
+                try:
+                    sess = requests.Session()
+                    
+                    def progress_cb(done, total):
+                        percent = 100.0 * done / total if total > 0 else 0
+                        status = f"{human_size(done)}/{human_size(total)}" if total > 0 else f"{human_size(done)}"
+                        progress_dialog.update_progress(
+                            percent, 
+                            f"Descargando server.jar...", 
+                            status
+                        )
+                    
+                    download_with_progress(sess, jar_url, jar_path, progress_cb=progress_cb)
+                    
+                    # Cerrar diálogo
+                    self.after(0, progress_dialog.destroy)
+                    self.after(0, lambda: self._log_sys("Descarga completa."))
+                    
+                except Exception as e:
+                    self.after(0, lambda: progress_dialog.destroy())
+                    self.after(0, lambda: self._log_sys(f"Error en descarga: {e}"))
+                    raise
+            
+            # Ejecutar descarga en hilo separado
+            threading.Thread(target=download_thread, daemon=True).start()
+            
+            # Esperar a que termine el diálogo
+            self.wait_window(progress_dialog)
 
         try:
             if Path(alias_path).exists():
@@ -1086,32 +1361,59 @@ class MinecraftGUI(tk.Tk):
                 raise RuntimeError("Selecciona la versión de Forge en Configurar antes de crear.")
             self._log_sys(f"Instalando Forge {forge_version} para {ver_id}...")
 
-            def cb(done, total):
-                if total > 0:
-                    self._log_sys(f"Descarga Forge: {100.0*done/total:.1f}% ({human_size(done)}/{human_size(total)})")
-                else:
-                    self._log_sys(f"Descarga Forge: {human_size(done)}")
-
-            installer = download_forge_installer(ver_id, forge_version, self.server_dir, progress_cb=cb)
-            java = self.app_config.get("java_path") or "java"
-            install_forge_server(installer, self.server_dir, java)
-
-            ensure_dir(self.mods_dir)
-            self._log_sys("Forge instalado y carpeta mods lista.")
-
-            write_text_file(self._eula_path(), "eula=true\n")
-            if not Path(self._server_properties_path()).exists():
-                self.server_properties["server-port"] = str(self.app_config.get("server_port", 25565))
-                self._save_server_properties()
-
-            self._log_sys("Arranque inicial (Forge puede tardar más)...")
-            self._start_server_impl(initial_boot=True)
+            # Diálogo de progreso para Forge
+            progress_dialog = ProgressDialog(self, title="Descargando Forge", max_value=100)
+            
+            def download_forge_thread():
+                try:
+                    def cb(done, total):
+                        percent = 100.0 * done / total if total > 0 else 0
+                        status = f"{human_size(done)}/{human_size(total)}" if total > 0 else f"{human_size(done)}"
+                        progress_dialog.update_progress(
+                            percent,
+                            f"Descargando Forge...",
+                            status
+                        )
+                    
+                    installer = download_forge_installer(ver_id, forge_version, self.server_dir, progress_cb=cb)
+                    
+                    # Instalar
+                    progress_dialog.update_progress(100, "Instalando Forge...", "Instalando...")
+                    java = self.app_config.get("java_path") or "java"
+                    install_forge_server(installer, self.server_dir, java)
+                    
+                    self.after(0, progress_dialog.destroy)
+                    self.after(0, lambda: self._complete_forge_setup())
+                    
+                except Exception as e:
+                    self.after(0, lambda: progress_dialog.destroy())
+                    self.after(0, lambda: self._log_sys(f"Error instalando Forge: {e}"))
+                    raise
+            
+            threading.Thread(target=download_forge_thread, daemon=True).start()
+            self.wait_window(progress_dialog)
+            
         except Exception as e:
             self._log_sys(f"Error creando servidor Forge: {e}")
             if Path(self.server_jar_alias_path).exists():
-                try: Path(self.server_jar_alias_path).unlink()
-                except Exception: pass
+                try: 
+                    Path(self.server_jar_alias_path).unlink()
+                except Exception: 
+                    pass
             raise
+    
+    def _complete_forge_setup(self):
+        """Completa la instalación de Forge después de la descarga."""
+        ensure_dir(self.mods_dir)
+        self._log_sys("Forge instalado y carpeta mods lista.")
+
+        write_text_file(self._eula_path(), "eula=true\n")
+        if not Path(self._server_properties_path()).exists():
+            self.server_properties["server-port"] = str(self.app_config.get("server_port", 25565))
+            self._save_server_properties()
+
+        self._log_sys("Arranque inicial (Forge puede tardar más)...")
+        self._start_server_impl(initial_boot=True)
 
     def _build_jvm_args(self):
         java = self.app_config.get("java_path") or "java"
@@ -1147,17 +1449,25 @@ class MinecraftGUI(tk.Tk):
 
     def _start_server_impl(self, initial_boot=False):
         java = self.app_config.get("java_path") or "java"
+
+        # Solo preguntar si la verificación falla
         if not self._check_java(java):
-            ans = messagebox.askyesno("Java no encontrado", "No se pudo confirmar Java. ¿Seleccionar ejecutable manualmente?")
+            ans = messagebox.askyesno(
+                "Java no encontrado",
+                "No se pudo confirmar Java. ¿Seleccionar ejecutable manualmente?"
+            )
             if ans:
-                path = filedialog.askopenfilename(title="Selecciona binario de Java", filetypes=[("Ejecutable", "*")])
+                path = filedialog.askopenfilename(
+                    title="Selecciona binario de Java",
+                    filetypes=[("Ejecutable", "*")]
+                )
                 if path:
                     self.app_config["java_path"] = path
                     self._save_app_config()
                 else:
-                    return
+                    return  # cancelado por el usuario
             else:
-                return
+                return  # usuario no quiso buscar Java
 
         # Sincronizar puerto
         try:
@@ -1204,9 +1514,39 @@ class MinecraftGUI(tk.Tk):
             if not self._server_exists():
                 messagebox.showwarning("Servidor no encontrado", "Primero usa 'Crear Servidor'.")
                 return
+                
+            # Verificar que existe el JAR
+            if not Path(self.server_jar_alias_path).exists():
+                messagebox.showerror("Error", f"No se encuentra {SERVER_JAR_ALIAS}. ¿Crear servidor de nuevo?")
+                return
+                
+            # Verificar que el puerto esté libre
+            port = int(self.app_config.get("server_port", 25565))
+            if not is_port_free(port):
+                owner = who_uses_port(port)
+                ans = messagebox.askyesno(
+                    "Puerto ocupado",
+                    f"El puerto {port} está ocupado por:\n{owner}\n\n¿Quieres cambiar el puerto en la configuración?"
+                )
+                if ans:
+                    self._open_config_dialog()
+                return
+                
             if self.server_proc.is_running():
                 messagebox.showinfo("Servidor", "Ya está en ejecución.")
                 return
+                
+            # Advertencia RCON
+            if self.app_config.get("enable_rcon", True):
+                messagebox.showwarning(
+                    "RCON Habilitado",
+                    "RCON está habilitado. Por seguridad:\n"
+                    "• Nunca expongas el puerto RCON a Internet\n"
+                    "• Usa contraseñas seguras\n"
+                    "• Considera deshabilitarlo si no lo necesitas",
+                    parent=self
+                )
+                
             self._start_server_impl(initial_boot=False)
         except Exception as e:
             self._log_sys(f"Error al iniciar: {e}")
@@ -1222,8 +1562,9 @@ class MinecraftGUI(tk.Tk):
             # Puerto ocupado?
             port = int(self.app_config.get("server_port", 25565))
             if not wait_port_release(port, timeout=12):
-                self._log_sys(f"Advertencia: el puerto {port} sigue ocupado. Puede quedar en TIME_WAIT unos segundos o "
-                              f"persistir si hay un proceso huérfano. Si continúa, reinicia Java o cambia el puerto en Configurar.")
+                owner = who_uses_port(port)
+                self._log_sys(f"Advertencia: el puerto {port} sigue ocupado por: {owner}")
+                self._log_sys("Puede quedar en TIME_WAIT unos segundos. Si continúa, reinicia Java o cambia el puerto.")
             self._refresh_status_labels()
         except Exception as e:
             self._log_sys(f"Error al detener: {e}")
@@ -1279,6 +1620,22 @@ class MinecraftGUI(tk.Tk):
         self._save_app_config()
         self._refresh_status_labels()
 
+    def _open_public(self):
+        """Abre la dirección pública en el navegador."""
+        val = self.var_public.get()
+        if not val or val.startswith("("):
+            messagebox.showinfo("Dirección pública", "Aún no se ha detectado una dirección.")
+            return
+            
+        # Para joinmc.link, abrir el panel web
+        if "joinmc.link" in val:
+            webbrowser.open(f"http://{val}")
+        else:
+            # Intentar con minecraft:// (no siempre funciona)
+            webbrowser.open(f"minecraft://{val}")
+            
+        self._log_sys(f"Abriendo: {val}")
+
     def _send_server_cmd(self):
         cmd = self.entry_cmd.get().strip()
         if not cmd:
@@ -1306,6 +1663,90 @@ class MinecraftGUI(tk.Tk):
             messagebox.showwarning("Servidor no accesible",
                                    "No se pudo enviar el comando.\nInicia el servidor desde la app o habilita RCON en Configurar.")
         self.entry_cmd.delete(0, tk.END)
+
+    # ---------- Backups ----------
+
+    def _create_backup(self):
+        """Crea un backup comprimido del mundo."""
+        world_dir = Path(self.server_dir) / "world"
+        if not world_dir.exists():
+            messagebox.showwarning("Backup", "No existe la carpeta 'world'.")
+            return
+            
+        backups_dir = Path(self.server_dir) / "backups"
+        ensure_dir(str(backups_dir))
+        
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_name = f"world-{timestamp}.zip"
+        backup_path = backups_dir / backup_name
+        
+        try:
+            with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(world_dir):
+                    for file in files:
+                        file_path = Path(root) / file
+                        # Mantener estructura de directorios relativa
+                        arcname = file_path.relative_to(world_dir.parent)
+                        zipf.write(file_path, arcname)
+                        
+            size = backup_path.stat().st_size
+            self._log_sys(f"Backup creado: {backup_name} ({human_size(size)})")
+            messagebox.showinfo("Backup", f"Backup creado exitosamente:\n{backup_name}\n({human_size(size)})")
+            
+        except Exception as e:
+            self._log_sys(f"Error creando backup: {e}")
+            messagebox.showerror("Error", f"No se pudo crear el backup:\n{e}")
+
+    def _restore_backup(self):
+        """Restaura un backup del mundo."""
+        if self.server_proc.is_running():
+            messagebox.showwarning("Servidor activo", "Detén el servidor antes de restaurar un backup.")
+            return
+            
+        backup_path = filedialog.askopenfilename(
+            title="Selecciona el archivo de backup",
+            filetypes=[("Archivos ZIP", "*.zip"), ("Todos los archivos", "*.*")]
+        )
+        if not backup_path:
+            return
+            
+        world_dir = Path(self.server_dir) / "world"
+        
+        # Confirmación
+        ans = messagebox.askyesno(
+            "Restaurar backup",
+            f"¿Restaurar backup?\n\nEsto reemplazará la carpeta 'world' actual.\n\nArchivo: {Path(backup_path).name}",
+            icon=messagebox.WARNING
+        )
+        if not ans:
+            return
+            
+        try:
+            # Hacer backup del mundo actual si existe
+            if world_dir.exists():
+                temp_backup = Path(self.server_dir) / f"world-backup-{int(time.time())}.zip"
+                with zipfile.ZipFile(temp_backup, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(world_dir):
+                        for file in files:
+                            file_path = Path(root) / file
+                            arcname = file_path.relative_to(world_dir.parent)
+                            zipf.write(file_path, arcname)
+                self._log_sys(f"Backup del mundo actual guardado como: {temp_backup.name}")
+            
+            # Eliminar mundo actual
+            if world_dir.exists():
+                shutil.rmtree(world_dir)
+                
+            # Extraer backup
+            with zipfile.ZipFile(backup_path, 'r') as zipf:
+                zipf.extractall(self.server_dir)
+                
+            self._log_sys("Backup restaurado exitosamente.")
+            messagebox.showinfo("Backup", "Backup restaurado exitosamente.")
+            
+        except Exception as e:
+            self._log_sys(f"Error restaurando backup: {e}")
+            messagebox.showerror("Error", f"No se pudo restaurar el backup:\n{e}")
 
     # ---------- Auxiliares ----------
 
@@ -1407,6 +1848,10 @@ class MinecraftGUI(tk.Tk):
                                   "3) El puerto/contraseña coinciden.")
 
     def _on_exit(self):
+        # Guardar geometría de ventana
+        self.app_config["window_geometry"] = self.geometry()
+        self._save_app_config()
+        
         try:
             if self.server_proc.is_running():
                 self.server_proc.terminate(gently=True, gentle_cmd="stop", wait_sec=15)
@@ -1724,6 +2169,8 @@ class MinecraftGUI(tk.Tk):
             "5) Hardcore: actívalo en 'Propiedades'; fuerza difficulty=hard automáticamente.\n"
             "6) Optimiza: ajusta Xms/Xmx y flags JVM en 'Rendimiento y Red' / 'Optimización'.\n"
             "7) Autosave: ejecuta 'save-all flush' automáticamente cada N minutos.\n"
+            "8) Backups: usa 'Archivo → Crear/Restaurar backup' para proteger tu mundo.\n"
+            "9) Filtros: oculta logs INFO con la casilla en la barra inferior.\n"
         )
         messagebox.showinfo("Ayuda", text)
 
